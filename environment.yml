@@ -1,4 +1,4 @@
-name: LDAWT
+name: FLOW-DC
 channels:
 - defaults
 - conda-forge

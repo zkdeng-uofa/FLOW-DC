@@ -316,17 +316,23 @@ async def download_single(
         - error: Error message (or None if success)
         - status_code: HTTP status code (or None if other error)
     """
+    #########################################################
     # Sanitize class name
+    #########################################################
     class_name = sanitize_class_name(class_name)
     
+    #########################################################
     # Validate URL
+    #########################################################
     if pd.isna(url) or not str(url).strip():
         return key, None, class_name, "Invalid image URL", None
     
     url = str(url).strip()
     
 
+    #########################################################
     # FILE NAMING
+    #########################################################
     # Use provided filename or generate from URL
     if filename is not None:
         # Use the provided filename directly
@@ -341,22 +347,32 @@ async def download_single(
         else:
             filename = f"{base_url.split('/')[-1]}{original_ext}"
     
+    #########################################################
     # Determine file path
+    #########################################################
     file_path = determine_file_path(output_folder, output_format, class_name, filename)
 
     
+    #########################################################
     # Acquire rate limit token if needed
+    #########################################################
     if token_bucket and enable_rate_limiting:
         await token_bucket.acquire()
 
+    #########################################################
     # DOWNLOAD
+    #########################################################
     content, status_code, error = await download_via_http_get(session, url, timeout)
 
+    #########################################################
     # Handle download result
+    #########################################################
     if error or content is None:
         return key, file_path, class_name, error, status_code
     
+    #########################################################
     # Save based on output format
+    #########################################################
     if total_bytes is None:
         total_bytes = []
     
@@ -421,22 +437,22 @@ def load_input_file(file_path, file_format=None):
         raise Exception(f"Failed to read input file {file_path}: {e}")
 
 
-def extract_url_and_label(row, url_col, label_col):
-    """
-    Extract URL and label from a dataframe row.
+# def extract_url_and_label(row, url_col, label_col):
+#     """
+#     Extract URL and label from a dataframe row.
     
-    Args:
-        row: pandas Series (dataframe row)
-        url_col: Column name containing URLs
-        label_col: Column name containing labels
+#     Args:
+#         row: pandas Series (dataframe row)
+#         url_col: Column name containing URLs
+#         label_col: Column name containing labels
         
-    Returns:
-        Tuple of (url, label, key)
-    """
-    key = row.name
-    url = row[url_col] if url_col in row else None
-    label = row[label_col] if label_col in row else None
-    return url, label, key
+#     Returns:
+#         Tuple of (url, label, key)
+#     """
+#     key = row.name
+#     url = row[url_col] if url_col in row else None
+#     label = row[label_col] if label_col in row else None
+#     return url, label, key
 
 
 # Standalone main for testing single URL download
