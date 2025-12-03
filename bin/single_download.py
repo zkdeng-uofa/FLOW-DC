@@ -20,11 +20,13 @@ def sanitize_class_name(class_name):
     Clean class name for filesystem compatibility.
     
     Args:
-        class_name: Raw class name from data
+        class_name: Raw class name from data (can be None)
         
     Returns:
-        Sanitized class name safe for filesystem
+        Sanitized class name safe for filesystem, or "output" if None
     """
+    if class_name is None:
+        return "output"
     if pd.isna(class_name):
         return "unknown"
     return str(class_name).replace("'", "").replace('"', "").replace(" ", "_").replace("/", "_")
@@ -55,116 +57,6 @@ def extract_extension(url):
     return base_url, original_ext
 
 
-# def generate_filename_from_pattern(image_url, base_url, original_ext, pattern="{segment[-2]}"):
-#     """
-#     Generate filename from URL using a safe template pattern.
-    
-#     Available placeholders:
-#         {segment[n]}  - URL path segment at index n (supports negative indexing)
-#         {segment[-1]} - Last segment (filename)
-#         {segment[-2]} - Second to last segment
-#         {hash}        - MD5 hash of full URL
-#         {hash[:8]}    - First 8 chars of hash
-#         {uuid}        - Extract UUID-like pattern from URL
-#         {path}        - Full sanitized path
-        
-#     Args:
-#         image_url: Full image URL
-#         base_url: URL without extension (from os.path.splitext)
-#         original_ext: File extension (e.g., '.jpg')
-#         pattern: Template string with placeholders
-        
-#     Returns:
-#         Generated filename with extension
-#     """
-#     # Parse URL and get segments
-#     parsed = urlparse(image_url)
-#     segments = [s for s in parsed.path.split('/') if s]  # Remove empty strings
-    
-#     # Prepare safe variables for substitution
-#     variables = {
-#         'hash': hashlib.md5(image_url.encode()).hexdigest(),
-#         'uuid': extract_uuid_from_url(image_url),
-#         'path': '_'.join(segments) if segments else 'file',
-#     }
-    
-#     # Process the pattern
-#     result = pattern
-    
-#     # Handle {segment[index]} patterns with regex
-#     def replace_segment(match):
-#         index_str = match.group(1)
-#         try:
-#             index = int(index_str)
-#             if -len(segments) <= index < len(segments):
-#                 return segments[index]
-#             else:
-#                 # Index out of range, use fallback
-#                 return segments[-1] if segments else 'file'
-#         except (ValueError, IndexError):
-#             return 'file'
-    
-#     # Replace {segment[n]} patterns
-#     result = re.sub(r'\{segment\[(-?\d+)\]\}', replace_segment, result)
-    
-#     # Handle slicing like {hash[:8]}
-#     def replace_slice(match):
-#         var_name = match.group(1)
-#         slice_part = match.group(2)
-        
-#         if var_name not in variables:
-#             return ''
-        
-#         value = variables[var_name]
-        
-#         # Parse slice notation
-#         if slice_part:
-#             try:
-#                 # Handle [:n] or [n:] or [n:m]
-#                 slice_match = re.match(r'\[(\d*):(\d*)\]', slice_part)
-#                 if slice_match:
-#                     start = int(slice_match.group(1)) if slice_match.group(1) else None
-#                     end = int(slice_match.group(2)) if slice_match.group(2) else None
-#                     return value[start:end]
-#             except:
-#                 return value
-#         return value
-    
-#     # Replace {variable[:n]} patterns
-#     result = re.sub(r'\{(\w+)(\[[\d:]*\])?\}', replace_slice, result)
-    
-#     # Sanitize the result (remove invalid filename characters)
-#     result = sanitize_filename(result)
-    
-#     # Ensure we have a valid filename
-#     if not result or result == '.':
-#         result = hashlib.md5(image_url.encode()).hexdigest()[:12]
-    
-#     return f"{result}{original_ext}"
-
-
-# def extract_uuid_from_url(url):
-#     """Extract UUID-like pattern from URL (8+ alphanumeric chars)."""
-#     # Look for UUID patterns (like 'a1b2c3d4' or longer)
-#     matches = re.findall(r'[a-f0-9]{8,}', url.lower())
-#     return matches[0] if matches else hashlib.md5(url.encode()).hexdigest()[:12]
-
-
-# def sanitize_filename(filename):
-    """Remove or replace invalid filename characters."""
-    # Replace invalid characters with underscore
-    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-    # Remove control characters
-    filename = ''.join(c for c in filename if ord(c) >= 32)
-    # Collapse multiple underscores
-    filename = re.sub(r'_+', '_', filename)
-    # Remove leading/trailing dots and underscores
-    filename = filename.strip('._')
-    # Limit length to 200 chars
-    filename = filename[:200]
-    return filename
-
-
 def determine_file_path(output_folder, output_format, class_name, filename):
     """
     Determine the full file path based on output format.
@@ -172,19 +64,22 @@ def determine_file_path(output_folder, output_format, class_name, filename):
     Args:
         output_folder: Base output folder
         output_format: 'imagefolder' or 'webdataset'
-        class_name: Class/label name
+        class_name: Class/label name (can be None, will use "output" for imagefolder)
         filename: Generated filename
         
     Returns:
         Full file path
     """
     if output_format == "imagefolder":
-        return os.path.join(output_folder, class_name, filename)
+        # Use "output" folder if class_name is None
+        folder_name = class_name if class_name is not None else "output"
+        return os.path.join(output_folder, folder_name, filename)
     elif output_format == "webdataset":
         return os.path.join(output_folder, filename)
     else:
         # Default to imagefolder
-        return os.path.join(output_folder, class_name, filename)
+        folder_name = class_name if class_name is not None else "output"
+        return os.path.join(output_folder, folder_name, filename)
 
 
 def save_imagefolder(content, file_path, key, image_url, class_name, total_bytes):
@@ -212,6 +107,17 @@ def save_imagefolder(content, file_path, key, image_url, class_name, total_bytes
     except Exception as e:
         return False, str(e)
 
+def save_hf_parquet(content, file_path, total_bytes):
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'wb') as f:
+            f.write(content)
+        file_size = os.path.getsize(file_path)
+        total_bytes.append(file_size)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 
 def save_webdataset(content, file_path, key, image_url, class_name, total_bytes):
     """
@@ -222,7 +128,7 @@ def save_webdataset(content, file_path, key, image_url, class_name, total_bytes)
         file_path: Full path to save file
         key: Row key/identifier
         image_url: Original image URL
-        class_name: Class name
+        class_name: Class name (can be None, will be omitted from JSON if None)
         total_bytes: List to append file size to
         
     Returns:
@@ -237,12 +143,16 @@ def save_webdataset(content, file_path, key, image_url, class_name, total_bytes)
         
         # Create JSON metadata file
         json_path = file_path.rsplit('.', 1)[0] + ".json"
+        metadata = {
+            'key': key,
+            'image_url': image_url,
+        }
+        # Only include class_name if it's not None
+        if class_name is not None:
+            metadata['class_name'] = class_name
+        
         with open(json_path, 'w') as f:
-            json.dump({
-                'key': key,
-                'image_url': image_url,
-                'class_name': class_name,
-            }, f)
+            json.dump(metadata, f)
         
         return True, None
     except Exception as e:
@@ -277,6 +187,93 @@ async def download_via_http_get(session, url, timeout):
     except Exception as e:
         return None, None, str(e)
 
+async def download_hf_parquet(session, url, timeout, hf_token=None):
+    """
+    Download content from Hugging Face via HTTP GET request with optional authentication.
+    
+    Args:
+        session: aiohttp ClientSession
+        url: URL to download
+        timeout: Request timeout in seconds
+        hf_token: Optional Hugging Face token. If not provided, checks HF_TOKEN and 
+                 HUGGING_FACE_HUB_TOKEN environment variables.
+        
+    Returns:
+        Tuple of (content: bytes, status_code: int, error: str)
+    """
+    # Get token from parameter, or fall back to environment variables
+    if hf_token is None:
+        hf_token = os.getenv('HF_TOKEN') or os.getenv('HUGGING_FACE_HUB_TOKEN')
+    
+    # Prepare headers
+    headers = {}
+    if hf_token:
+        headers['Authorization'] = f'Bearer {hf_token}'
+    
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), headers=headers) as response:
+            if response.status == 200:
+                content = await response.read()
+                return content, response.status, None
+            else:
+                try:
+                    status_name = HTTPStatus(response.status).phrase
+                except ValueError:
+                    status_name = "Unknown"
+                return None, response.status, f"HTTP Error: {status_name}"
+    except asyncio.TimeoutError as e:
+        return None, 408, str(e)
+    except Exception as e:
+        return None, None, str(e)
+
+def load_input_file(file_path, file_format=None):
+    """
+    Load input file in various formats.
+    
+    Args:
+        file_path: Path to input file
+        file_format: Optional format hint ('parquet', 'csv', 'excel', 'xml')
+                    If None, inferred from file extension
+        
+    Returns:
+        pandas DataFrame
+        
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If format is unsupported
+        Exception: If file reading fails
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Input file {file_path} not found")
+    
+    # Determine format from extension if not provided
+    if file_format is None:
+        if file_path.endswith(".parquet"):
+            file_format = "parquet"
+        elif file_path.endswith(".csv") or file_path.endswith(".txt"):
+            file_format = "csv"
+        elif file_path.endswith(".xlsx") or file_path.endswith(".xls"):
+            file_format = "excel"
+        elif file_path.endswith(".xml"):
+            file_format = "xml"
+        else:
+            raise ValueError(f"Could not determine file format from extension: {file_path}")
+    
+    try:
+        if file_format == "parquet":
+            return pd.read_parquet(file_path)
+        elif file_format == "csv":
+            return pd.read_csv(file_path)
+        elif file_format == "excel":
+            return pd.read_excel(file_path)
+        elif file_format == "xml":
+            return pd.read_xml(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_format}")
+    except Exception as e:
+        raise Exception(f"Failed to read input file {file_path}: {e}")
+
+
 async def download_single(
     # Core identifiers
     url, key, class_name,
@@ -287,6 +284,8 @@ async def download_single(
     filename=None,
     # Rate limiting (optional)
     token_bucket=None, enable_rate_limiting=False,
+    # Hugging Face authentication (optional)
+    hf_token=None,
     # Tracking
     total_bytes=None
 ):
@@ -306,6 +305,8 @@ async def download_single(
         download_method: Download method ('http_get', 'hf_api', 'aws_api')
         token_bucket: Optional TokenBucket for rate limiting
         enable_rate_limiting: Whether rate limiting is enabled
+        hf_token: Optional Hugging Face token for authentication. If not provided, checks
+                 HF_TOKEN and HUGGING_FACE_HUB_TOKEN environment variables.
         total_bytes: Optional list to track file sizes
         
     Returns:
@@ -362,12 +363,19 @@ async def download_single(
     #########################################################
     # DOWNLOAD
     #########################################################
-    content, status_code, error = await download_via_http_get(session, url, timeout)
+    #content, status_code, error = await download_via_http_get(session, url, timeout)
+
+    content, status_code, error = await download_hf_parquet(session, url, timeout, hf_token)
+
 
     #########################################################
     # Handle download result
     #########################################################
-    if error or content is None:
+    if content is None:
+        print("Content is None")
+        return key, file_path, class_name, error, status_code
+    elif error or content is None:
+        print(f"Error: {error}")
         return key, file_path, class_name, error, status_code
     
     #########################################################
@@ -389,98 +397,20 @@ async def download_single(
     else:
         return key, file_path, class_name, save_error, status_code
 
-def load_input_file(file_path, file_format=None):
-    """
-    Load input file in various formats.
-    
-    Args:
-        file_path: Path to input file
-        file_format: Optional format hint ('parquet', 'csv', 'excel', 'xml')
-                    If None, inferred from file extension
-        
-    Returns:
-        pandas DataFrame
-        
-    Raises:
-        FileNotFoundError: If file doesn't exist
-        ValueError: If format is unsupported
-        Exception: If file reading fails
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Input file {file_path} not found")
-    
-    # Determine format from extension if not provided
-    if file_format is None:
-        if file_path.endswith(".parquet"):
-            file_format = "parquet"
-        elif file_path.endswith(".csv") or file_path.endswith(".txt"):
-            file_format = "csv"
-        elif file_path.endswith(".xlsx") or file_path.endswith(".xls"):
-            file_format = "excel"
-        elif file_path.endswith(".xml"):
-            file_format = "xml"
-        else:
-            raise ValueError(f"Could not determine file format from extension: {file_path}")
-    
-    try:
-        if file_format == "parquet":
-            return pd.read_parquet(file_path)
-        elif file_format == "csv":
-            return pd.read_csv(file_path)
-        elif file_format == "excel":
-            return pd.read_excel(file_path)
-        elif file_format == "xml":
-            return pd.read_xml(file_path)
-        else:
-            raise ValueError(f"Unsupported file format: {file_format}")
-    except Exception as e:
-        raise Exception(f"Failed to read input file {file_path}: {e}")
-
-
-# def extract_url_and_label(row, url_col, label_col):
-#     """
-#     Extract URL and label from a dataframe row.
-    
-#     Args:
-#         row: pandas Series (dataframe row)
-#         url_col: Column name containing URLs
-#         label_col: Column name containing labels
-        
-#     Returns:
-#         Tuple of (url, label, key)
-#     """
-#     key = row.name
-#     url = row[url_col] if url_col in row else None
-#     label = row[label_col] if label_col in row else None
-#     return url, label, key
-
-
 # Standalone main for testing single URL download
 async def main_single():
     """
     Standalone main function for testing single URL download.
     Can be called directly for debugging/testing.
     """
-    # import argparse
-    
-    # parser = argparse.ArgumentParser(description="Download a single URL")
-    # parser.add_argument("--url", type=str, required=True, help="URL to download")
-    # parser.add_argument("--output", type=str, required=True, help="Output folder")
-    # parser.add_argument("--output_format", type=str, default="imagefolder", choices=["imagefolder", "webdataset"])
-    # parser.add_argument("--class_name", type=str, default="test", help="Class name")
-    # parser.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
-    # parser.add_argument("--file_name_pattern", type=str, default="{segment[-2]}", help="Filename pattern")
-    # parser.add_argument("--download_method", type=str, default="http_get", choices=["http_get", "hf_api", "aws_api"])
-    
-    # args = parser.parse_args()
-
-    url = "https://api.gbif.org/v1/image/unsafe/https%3A%2F%2Fmoth.tbn.org.tw%2Fimages%2Ftwmoth003%2Ftwmoth012846.jpg"
-    output = "test_output"
+    #url = "https://api.gbif.org/v1/image/unsafe/https%3A%2F%2Fmoth.tbn.org.tw%2Fimages%2Ftwmoth003%2Ftwmoth012846.jpg"
+    url = "https://huggingface.co/datasets/ILSVRC/imagenet-1k/resolve/main/data/train-00000-of-00294.parquet"
+    output_folder = "files/output/"
     output_format = "imagefolder"
-    class_name = "moth"
-    timeout = 30
-    file_name_pattern = "{segment[-1]}"
-    download_method = "http_get"
+    class_name = None
+    timeout = 600
+    
+    hf_token = "your_hf_token_here"  # Will check environment variables if None
     
     # Create session
     async with aiohttp.ClientSession() as session:
@@ -488,12 +418,12 @@ async def main_single():
             url=url,
             key="test_key",
             class_name=class_name,
-            output_folder=output,
+            output_folder=output_folder,
             output_format=output_format,
             session=session,
             timeout=timeout,
-            file_name_pattern=file_name_pattern,
-            download_method=download_method
+            filename="hf_train_0.parquet",
+            hf_token=hf_token  # Pass token or None to use environment variable
         )
         
         key, file_path, class_name, error, status_code = result

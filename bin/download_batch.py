@@ -25,8 +25,6 @@ import threading
 from single_download import (
     download_single,
     load_input_file,
-    #extract_url_and_label,
-    #sanitize_class_name,
     extract_extension
 )
 
@@ -70,7 +68,7 @@ def parse_args():
     parser.add_argument("--input", type=str, help="Path to the input CSV or Parquet file.")
     parser.add_argument("--input_format", type=str, default="parquet", help="Input file format (default: parquet).")
     parser.add_argument("--url", type=str, default="photo_url", help="Column name containing the image URLs.")
-    parser.add_argument("--label", type=str, default="taxon_name", help="Column name containing the class names.")
+    parser.add_argument("--label", type=str, default=None, help="Column name containing the class names (optional). If not provided, all files will be placed in 'output' folder for imagefolder format, and class_name will be omitted from webdataset JSON metadata.")
 
     parser.add_argument("--output", type=str, help="Path to the output tar file (e.g., 'images.tar.gz').")
     parser.add_argument("--output_format", type=str, default="imagefolder", help="Output file format (default: tar).")
@@ -88,9 +86,6 @@ def parse_args():
     # File naming pattern
     parser.add_argument("--file_name_pattern", type=str, default="{segment[-2]}", help="Pattern for filename generation (default: {segment[-2]}).")
     parser.add_argument("--naming_mode", type=str, default="url_based", choices=["url_based", "sequential"], help="File naming mode: url_based (default) or sequential (00000001.ext, 00000002.ext, etc.).")
-    
-    # Download method
-    parser.add_argument("--download_method", type=str, default="http_get", choices=["http_get", "hf_api", "aws_api"], help="Download method to use (default: http_get).")
     
     # Croissant metadata optional fields
     parser.add_argument("--dataset_name", type=str, help="Name for the dataset (default: output folder name).")
@@ -134,7 +129,7 @@ def load_json_config(config_path):
     required_fields = ['input', 'output']
     defaults = {
         'url': 'photo_url',
-        'label': 'taxon_name',
+        'label': None,
         'input_format': 'parquet',
         'output_format': 'imagefolder',
         'concurrent_downloads': 1000,
@@ -147,7 +142,6 @@ def load_json_config(config_path):
         'croissant': 'no_croissant',
         'file_name_pattern': '{segment[-2]}',
         'naming_mode': 'url_based',
-        'download_method': 'http_get',
         'dataset_name': None,
         'dataset_description': None,
         'dataset_license': 'Unspecified',
@@ -182,13 +176,17 @@ def load_json_config(config_path):
         'enable_rate_limiting': bool,
         'max_retry_attempts': int,
         'file_name_pattern': str,
-        'naming_mode': str,
-        'download_method': str,
+        'naming_mode': str
     }
     for field, expected_type in type_validators.items():
         if not isinstance(config_data[field], expected_type):
             print(f"Error: Field '{field}' has invalid type. Expected {expected_type}, got {type(config_data[field])}.")
             sys.exit(1)
+    
+    # Special validation for label field (can be None or str)
+    if 'label' in config_data and config_data['label'] is not None and not isinstance(config_data['label'], str):
+        print(f"Error: Field 'label' has invalid type. Expected str or None, got {type(config_data['label'])}.")
+        sys.exit(1)
     
     # Convert to argparse.Namespace for compatibility
     return argparse.Namespace(**config_data)
@@ -481,7 +479,7 @@ async def download_batch(
     # Rate limiting
     token_bucket, enable_rate_limiting, rate_controller,
     # File naming and download method
-    file_name_pattern, download_method, naming_mode,
+    file_name_pattern, naming_mode,
     # Retry control
     attempt_number=1
 ):
@@ -508,7 +506,7 @@ async def download_batch(
     tasks = [
         download_single(
             # Core identifiers
-            url=row[url_col], key=row.name, class_name=row[class_col],
+            url=row[url_col], key=row.name, class_name=row[class_col] if class_col is not None else None,
             # Output config
             output_folder=output_folder, output_format=output_format,
             # Network/session
@@ -617,6 +615,11 @@ def validate_and_clean(
 
     if url_col not in df.columns:
         print(f"Error: URL column {url_col} not found in input file {input}")
+        sys.exit(1)
+
+    # Only validate class_col if it's provided
+    if class_col is not None and class_col not in df.columns:
+        print(f"Error: Label column {class_col} not found in input file {input}")
         sys.exit(1)
 
     initial_count = len(df)
@@ -794,7 +797,10 @@ def create_croissant_metadata(
         if dataset_description:
             description = dataset_description
         else:
-            description = f"Image dataset downloaded and organized by {class_col}. Contains {successful_downloads} successfully downloaded images across {len(classes)} classes."
+            if class_col is not None:
+                description = f"Image dataset downloaded and organized by {class_col}. Contains {successful_downloads} successfully downloaded images across {len(classes)} classes."
+            else:
+                description = f"Image dataset containing {successful_downloads} successfully downloaded images."
         
         metadata = {
             "@context": "https://schema.org/",
@@ -832,25 +838,30 @@ def create_croissant_metadata(
         
         # Basic recordSet structure
         if classes:
-            metadata["recordSet"] = {
+            recordSet = {
                 "@type": "ml:RecordSet",
                 "name": "images",
-                "description": f"Image records organized by {class_col}",
                 "field": [
                     {
                         "@type": "ml:Field",
                         "name": "image",
                         "description": "The image file",
                         "dataType": "ml:Image"
-                    },
-                    {
-                        "@type": "ml:Field",
-                        "name": class_col,
-                        "description": "The class label",
-                        "dataType": "sc:Text"
                     }
                 ]
             }
+            # Add description and class field only if class_col is provided
+            if class_col is not None:
+                recordSet["description"] = f"Image records organized by {class_col}"
+                recordSet["field"].append({
+                    "@type": "ml:Field",
+                    "name": class_col,
+                    "description": "The class label",
+                    "dataType": "sc:Text"
+                })
+            else:
+                recordSet["description"] = "Image records"
+            metadata["recordSet"] = recordSet
         
         # Add comprehensive metadata if requested
         if croissant_mode == "comprehensive_croissant":
@@ -873,7 +884,10 @@ def create_croissant_metadata(
                 keywords = [k.strip() for k in dataset_keywords.split(",")]
                 metadata["keywords"] = keywords
             else:
-                metadata["keywords"] = ["images", "classification", class_col]
+                if class_col is not None:
+                    metadata["keywords"] = ["images", "classification", class_col]
+                else:
+                    metadata["keywords"] = ["images"]
             
             # Add detailed class information
             if classes:
@@ -974,7 +988,6 @@ async def main():
     croissant_mode = args.croissant
     file_name_pattern = args.file_name_pattern
     naming_mode = args.naming_mode
-    download_method = args.download_method
     
     # Extract Croissant metadata arguments
     dataset_name = args.dataset_name
@@ -1033,7 +1046,7 @@ async def main():
                 url_col, class_col,
                 total_bytes, timeout,
                 token_bucket, enable_rate_limiting, rate_controller,
-                file_name_pattern, download_method, naming_mode,
+                file_name_pattern, naming_mode,
                 attempt
             )
 
