@@ -204,6 +204,9 @@ class TokenBucket:
         self._update_capacity(rate)
         # Initialize tokens to capacity
         self.tokens = self.capacity
+        # Cooldown tracking for immediate_decrease
+        self._last_decrease_time = 0      # Timestamp of last immediate_decrease
+        self._decrease_cooldown = 2.0     # Cooldown period in seconds
 
     async def acquire(self):
         """
@@ -256,14 +259,21 @@ class TokenBucket:
         """
         Immediately decrease rate by factor (thread-safe).
         Used for immediate response to rate-limiting errors.
+        Has a cooldown to prevent burst errors from cascading.
         """
         with self._lock:
+            now = time.time()
+            # Cooldown: only decrease once per cooldown period
+            if now - self._last_decrease_time < self._decrease_cooldown:
+                return self.rate  # Skip - already decreased recently
+            
             new_rate = max(1, self.rate * factor)
             if abs(new_rate - self.rate) > 0.1:
                 # Update capacity proportionally to new rate
                 self._update_capacity(new_rate)
                 print(f"[Rate Limit] Immediate decrease: {self.rate:.2f} -> {new_rate:.2f} req/sec (capacity: {self.capacity})")
                 self.rate = new_rate
+                self._last_decrease_time = now
                 return new_rate
         return self.rate
 
@@ -547,6 +557,11 @@ class BBRController:
         self.initial_rate = initial_rate
         
         self._lock = threading.RLock()
+        
+        # Error recovery tracking
+        self.error_suppressed_rate = None  # Rate cap after errors
+        self.recovery_intervals = 0        # Consecutive error-free intervals
+        self.RECOVERY_THRESHOLD = 20        # Intervals needed before full rate
     
     def update_file_size(self, bytes_downloaded):
         """
@@ -757,6 +772,62 @@ class BBRController:
     def get_state(self):
         """Get current BBR state."""
         return self.state
+    
+    def enter_error_recovery(self, current_rate, error_count=1):
+        """
+        Enter error recovery mode - cap rate and reduce BtlBw estimate.
+        
+        Args:
+            current_rate: Current token bucket rate after immediate decreases
+            error_count: Number of errors in this interval
+        """
+        with self._lock:
+            # Cap rate at current level
+            self.error_suppressed_rate = current_rate
+            self.recovery_intervals = 0
+            
+            # Reduce BtlBw proportionally to error severity
+            if self.btlbw is not None:
+                reduction = max(0.3, 1.0 - (error_count * 0.1))  # At least 70% reduction for many errors
+                self.btlbw *= reduction
+                self.bw_history.clear()
+                self.bw_history.append(self.btlbw)
+                print(f"[BBR] Error recovery: BtlBw reduced to {self.btlbw / 1e6:.2f} MB/s, rate capped at {current_rate:.0f} req/s")
+    
+    def check_recovery(self, has_errors):
+        """
+        Check if we can exit error recovery mode.
+        
+        Args:
+            has_errors: Whether current interval had rate-limiting errors
+            
+        Returns:
+            True if still in recovery, False if can resume normal operation
+        """
+        with self._lock:
+            if self.error_suppressed_rate is None:
+                return False  # Not in recovery
+            
+            if has_errors:
+                self.recovery_intervals = 0
+                return True  # Stay in recovery
+            
+            self.recovery_intervals += 1
+            if self.recovery_intervals >= self.RECOVERY_THRESHOLD:
+                print(f"[BBR] Exiting error recovery after {self.recovery_intervals} clean intervals")
+                self.error_suppressed_rate = None
+                return False
+            
+            return True  # Still in recovery
+    
+    def get_recovery_rate_cap(self):
+        """Get the rate cap during error recovery, or None if not in recovery."""
+        with self._lock:
+            if self.error_suppressed_rate is None:
+                return None
+            # Allow gradual increase: 10% per clean interval
+            multiplier = 1.0 + (self.recovery_intervals * 0.1)
+            return self.error_suppressed_rate * multiplier
 
 
 class ConcurrencyLimiter:
@@ -773,7 +844,7 @@ class ConcurrencyLimiter:
         self._condition = asyncio.Condition()
     
     async def acquire(self):
-        """Acquire a slot (blocks if at limit)."""
+        """Acquire a slot (blocks if at limit, with timeout for shutdown)."""
         async with self._condition:
             while self._current_count >= self._limit:
                 await self._condition.wait()
@@ -842,8 +913,10 @@ async def aimd_convergence_controller(
     intervals_in_state = 0
     rate_history = deque(maxlen=CONVERGENCE_WINDOW)  # Track rate changes
     
-    while True:
+    while not shutdown_flag:
         await asyncio.sleep(interval)
+        if shutdown_flag:
+            break
         
         current_rate = token_bucket.get_rate()
         rate_history.append(current_rate)
@@ -924,7 +997,7 @@ async def bbr_rate_controller(
     interval=5
 ):
     """
-    BBR-like rate controller loop.
+    BBR-like rate controller loop with error recovery.
     
     Uses measured throughput and RTT to compute optimal pacing rate and
     concurrency, while respecting 429/5xx rate limiting signals.
@@ -942,8 +1015,10 @@ async def bbr_rate_controller(
     
     print(f"[BBR] Starting BBR rate controller (interval={interval}s, max_rate={max_rate} req/s)")
     
-    while True:
+    while not shutdown_flag:
         await asyncio.sleep(interval)
+        if shutdown_flag:
+            break
         now = time.time()
         
         # 1. Get metrics from last interval
@@ -954,22 +1029,31 @@ async def bbr_rate_controller(
         # 2. Update BBR model with measurements
         bbr_controller.update_model(throughput, min_rtt, now)
         
-        # 3. Run BBR state machine to get targets
-        target_rate, target_concurrency = bbr_controller.step(
-            download_metrics, rate_controller, now
-        )
+        # 3. Check for errors and handle recovery
+        has_errors = rate_controller.current_interval_has_error
+        in_recovery = bbr_controller.check_recovery(has_errors)
+        
+        if has_errors and not in_recovery:
+            # Just entered error state - enter recovery with current (reduced) rate
+            current_rate = token_bucket.get_rate()
+            bbr_controller.enter_error_recovery(current_rate, error_count=10)  # Assume burst
         
         # 4. Start new interval for rate controller (safety layer)
         rate_controller.start_new_interval()
         
-        # 5. Apply RateController safety clamps (429/5xx protection)
-        if rate_controller.current_interval_has_error:
-            if target_rate:
-                target_rate *= MULTIPLICATIVE_DECREASE
-            bbr_controller.clamp_btlbw(throughput)  # Update model
-            print(f"[BBR] Policy error detected, clamping rate by {int((1-MULTIPLICATIVE_DECREASE)*100)}%")
+        # 5. Run BBR state machine to get targets
+        target_rate, target_concurrency = bbr_controller.step(
+            download_metrics, rate_controller, now
+        )
         
-        # 6. Apply final rate
+        # 6. Apply recovery cap if in recovery mode
+        recovery_cap = bbr_controller.get_recovery_rate_cap()
+        if recovery_cap is not None and target_rate is not None:
+            if target_rate > recovery_cap:
+                print(f"[BBR] Recovery: capping rate {target_rate:.0f} → {recovery_cap:.0f} req/s")
+                target_rate = recovery_cap
+        
+        # 7. Apply final rate
         if target_rate:
             final_rate = min(target_rate, max_rate)
             final_rate = max(1, final_rate)  # Minimum 1 req/s
@@ -979,13 +1063,14 @@ async def bbr_rate_controller(
             btlbw_mbps = (bbr_controller.btlbw or 0) / 1e6
             rtprop_ms = (bbr_controller.rtprop or 0) * 1000
             bdp_kb = (bbr_controller.get_bdp_bytes() or 0) / 1024
-            print(f"[BBR] {bbr_controller.get_state()}: "
+            recovery_status = " [RECOVERY]" if recovery_cap else ""
+            print(f"[BBR] {bbr_controller.get_state()}{recovery_status}: "
                   f"rate={final_rate:.0f} req/s, "
                   f"BtlBw={btlbw_mbps:.2f} MB/s, "
                   f"RTprop={rtprop_ms:.0f}ms, "
                   f"BDP={bdp_kb:.0f}KB")
         
-        # 7. Apply concurrency limit
+        # 8. Apply concurrency limit
         if target_concurrency:
             concurrency_limiter.set_limit(target_concurrency)
 
