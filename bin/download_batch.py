@@ -17,10 +17,9 @@ import json
 from pathlib import Path 
 from tqdm.asyncio import tqdm
 import signal
-import shutil
 from collections import deque
 import threading
-
+import shutil
 # Import single download functions
 from single_download_gbif import (
     download_single,
@@ -80,7 +79,6 @@ def parse_args():
     parser.add_argument("--rate_capacity", type=int, default=200, help="Token bucket capacity (default: 200).")
     parser.add_argument("--enable_rate_limiting", action="store_true", help="Enable token bucket rate limiting.")
     parser.add_argument("--max_retry_attempts", type=int, default=3, help="Maximum retry attempts for 429 errors (default: 3).")
-    parser.add_argument("--rate_control_mode", type=str, default="aimd", choices=["aimd", "bbr"], help="Rate control algorithm: aimd (default) or bbr (model-based).")
     parser.add_argument("--create_overview", action="store_true", default=True, help="Create JSON overview file (default: True).")
     parser.add_argument("--croissant", type=str, default="no_croissant", choices=["no_croissant", "basic_croissant", "comprehensive_croissant"], help="Generate Croissant metadata: no_croissant (default), basic_croissant, or comprehensive_croissant.")
     
@@ -139,7 +137,6 @@ def load_json_config(config_path):
         'rate_capacity': 200,
         'enable_rate_limiting': False,
         'max_retry_attempts': 0,
-        'rate_control_mode': 'aimd',
         'create_overview': True,
         'croissant': 'no_croissant',
         'file_name_pattern': '{segment[-2]}',
@@ -177,7 +174,6 @@ def load_json_config(config_path):
         'rate_capacity': int,
         'enable_rate_limiting': bool,
         'max_retry_attempts': int,
-        'rate_control_mode': str,
         'file_name_pattern': str,
         'naming_mode': str
     }
@@ -286,7 +282,6 @@ class RateController:
     def __init__(self, window_size=100):
         self.results = deque(maxlen=window_size)  # (success, status_code, error_message) tuples
         self.interval_results = []  # Results for current interval
-        self.perfect_success_intervals = 0  # Consecutive intervals with 100% success
         self._lock = threading.Lock()
         self.current_interval_has_error = False  # Track if current interval has rate-limiting error
     
@@ -326,64 +321,11 @@ class RateController:
                 self.results.append((False, status_code, error_message))
                 self.interval_results.append((False, status_code, error_message))
     
-    def get_success_rate(self):
-        """
-        Calculate success rate for probing (only 429/500+/connection errors count as failures).
-        Returns success rate as float between 0.0 and 1.0.
-        """
-        with self._lock:
-            if not self.results:
-                return 1.0  # Optimistic start
-            
-            # Count successes and rate-limiting failures
-            successes = 0
-            rate_limiting_failures = 0
-            
-            for success, status_code, *rest in self.results:
-                error_message = rest[0] if rest else None
-                if success:
-                    successes += 1
-                elif self.is_rate_limiting_error(status_code, error_message):
-                    rate_limiting_failures += 1
-                # Other errors (404, 403, etc.) are ignored
-            
-            total_relevant = successes + rate_limiting_failures
-            if total_relevant == 0:
-                return 1.0
-            
-            return successes / total_relevant
-    
-    def has_perfect_success(self):
-        """
-        Binary check: True if no 429/500+/connection errors in current interval.
-        Used for AIMD binary logic.
-        """
-        with self._lock:
-            return not self.current_interval_has_error
-    
-    def get_perfect_success_intervals(self):
-        """Get count of consecutive intervals with 100% success."""
-        with self._lock:
-            return self.perfect_success_intervals
-    
     def start_new_interval(self):
-        """
-        Called at start of each interval to reset interval tracking.
-        Updates perfect_success_intervals counter.
-        """
+        """Called at start of each interval to reset interval tracking."""
         with self._lock:
-            if not self.current_interval_has_error:
-                self.perfect_success_intervals += 1
-            else:
-                self.perfect_success_intervals = 0  # Reset on error
-            
             self.current_interval_has_error = False
             self.interval_results = []
-    
-    def reset_perfect_success_intervals(self):
-        """Reset the perfect success intervals counter (thread-safe)."""
-        with self._lock:
-            self.perfect_success_intervals = 0
 
 
 class DownloadMetrics:
@@ -877,116 +819,6 @@ class ConcurrencyLimiter:
         return self._current_count
 
 
-async def aimd_convergence_controller(
-    # Rate limiting
-    token_bucket, rate_controller, max_rate,
-    # Timing
-    interval=5
-):
-    """
-    Adaptive rate controller with AIMD, convergence detection, and periodic probing.
-    
-    States:
-    - EXPLORING: Binary AIMD (100% success = increase, 429/500+ error = immediate decrease)
-    - CONVERGED: Rate stable, holding at optimal
-    - PROBING: Success-rate based check to restart AIMD if conditions changed
-    """
-    # AIMD parameters (binary logic)
-    PERFECT_SUCCESS_INTERVALS = 3  # Must have 100% success for 3 intervals before increasing
-    ADDITIVE_INCREASE = 10  # req/s or 10% (whichever larger)
-    MULTIPLICATIVE_DECREASE = 0.7  # 30% reduction on errors
-    
-    # Convergence detection
-    CONVERGENCE_WINDOW = 10  # Rate must be stable for 10 intervals
-    CONVERGENCE_THRESHOLD = 10  # req/s (rate change < 10 req/s = stable)
-    
-    # Cruise phase
-    CRUISE_DURATION = 10  # Hold for 10 intervals before probing
-    
-    # Probing thresholds (success-rate based)
-    HIGH_THRESHOLD = 0.97  # 97% success = high headroom, restart upward
-    LOW_THRESHOLD = 0.80  # 80% success = too low, restart downward
-    
-    # State tracking
-    state = "EXPLORING"
-    converged_rate = None
-    intervals_in_state = 0
-    rate_history = deque(maxlen=CONVERGENCE_WINDOW)  # Track rate changes
-    
-    while not shutdown_flag:
-        await asyncio.sleep(interval)
-        if shutdown_flag:
-            break
-        
-        current_rate = token_bucket.get_rate()
-        rate_history.append(current_rate)
-        intervals_in_state += 1
-        
-        # Start new interval for rate controller
-        rate_controller.start_new_interval()
-        
-        if state == "EXPLORING":
-            # Binary AIMD logic
-            perfect_success_count = rate_controller.get_perfect_success_intervals()
-            
-            # Check if we should increase (100% success for N intervals)
-            if perfect_success_count >= PERFECT_SUCCESS_INTERVALS:
-                # Additive increase
-                increase_amount = max(ADDITIVE_INCREASE, current_rate * 0.1)
-                new_rate = min(max_rate, current_rate + increase_amount)
-                token_bucket.adjust_rate(new_rate, "additive increase (perfect success)")
-                rate_controller.reset_perfect_success_intervals()  # Reset counter
-                print(f"[AIMD] ↑ {current_rate:.0f} -> {new_rate:.0f} req/s (perfect success for {perfect_success_count} intervals)")
-            
-            # Check for convergence
-            if len(rate_history) >= CONVERGENCE_WINDOW:
-                # Check if rate has been stable (changes < threshold)
-                rate_changes = [abs(rate_history[i] - rate_history[i-1]) for i in range(1, len(rate_history))]
-                max_change = max(rate_changes) if rate_changes else 0
-                
-                if max_change < CONVERGENCE_THRESHOLD:
-                    converged_rate = current_rate
-                    state = "CONVERGED"
-                    intervals_in_state = 0
-                    print(f"[AIMD] ✓ Converged at {converged_rate:.0f} req/s")
-        
-        elif state == "CONVERGED":
-            # Hold rate constant
-            if intervals_in_state >= CRUISE_DURATION:
-                # Time to probe
-                state = "PROBING"
-                intervals_in_state = 0
-                print(f"[AIMD] → Entering PROBING phase (held at {converged_rate:.0f} req/s for {CRUISE_DURATION} intervals)")
-        
-        elif state == "PROBING":
-            # Success-rate based probing
-            success_rate = rate_controller.get_success_rate()
-            
-            if success_rate > HIGH_THRESHOLD:
-                # High headroom - restart AIMD upward
-                state = "EXPLORING"
-                intervals_in_state = 0
-                rate_history.clear()
-                rate_controller.reset_perfect_success_intervals()
-                print(f"[AIMD] → High headroom ({success_rate:.1%}), restarting AIMD exploration upward")
-            
-            elif success_rate < LOW_THRESHOLD:
-                # Low success rate - restart AIMD downward
-                new_rate = max(10, current_rate * MULTIPLICATIVE_DECREASE)
-                token_bucket.adjust_rate(new_rate, "probing: low success rate, restarting downward")
-                state = "EXPLORING"
-                intervals_in_state = 0
-                rate_history.clear()
-                rate_controller.reset_perfect_success_intervals()
-                print(f"[AIMD] → Low success rate ({success_rate:.1%}), decreasing to {new_rate:.0f} req/s and restarting AIMD")
-            
-            else:
-                # Acceptable range - continue holding
-                state = "CONVERGED"
-                intervals_in_state = 0
-                print(f"[AIMD] → Acceptable success rate ({success_rate:.1%}), returning to CONVERGED state")
-
-
 async def bbr_rate_controller(
     token_bucket,
     rate_controller,        # existing - safety layer for 429/5xx
@@ -1172,8 +1004,11 @@ async def download_batch(
     ]
 
     error_details = []
-    retry_rows =[]
+    retry_rows = []
     successful_downloads = 0
+    successful_keys = set()  # Track keys that succeeded
+    written_file_paths = {}  # Track file_path -> key for collision detection
+    collision_count = 0
 
     print(f"\n--- Attempt #{attempt_number} - Processing {len(tasks)} images ---")
     if enable_rate_limiting and token_bucket:
@@ -1222,11 +1057,22 @@ async def download_batch(
                     print(f"\n[Error] Key: {key}, Error: {error}, Status Code: {status_code}")
             else:
                 successful_downloads += 1
+                successful_keys.add(key)
+                
+                # Track file paths for collision detection
+                if file_path:
+                    if file_path in written_file_paths:
+                        collision_count += 1
+                        print(f"\n[Warning] Filename collision: {file_path}")
+                        print(f"  Previous key: {written_file_paths[file_path]}, Current key: {key}")
+                    else:
+                        written_file_paths[file_path] = key
     except KeyboardInterrupt:
         print("Download interrupted by user")
         shutdown_flag = True
 
-    return successful_downloads, error_details, retry_rows
+    unique_files_written = len(written_file_paths)
+    return successful_downloads, error_details, retry_rows, successful_keys, unique_files_written, collision_count
 
 
 def validate_and_clean(
@@ -1244,9 +1090,9 @@ def validate_and_clean(
         sys.exit(1)
     
     if os.path.exists(output_folder):
-        print(f"Error: Output folder {output_folder} already exists")
-        sys.exit(1)
-        #shutil.rmtree(output_folder)
+        print(f"Warning: Output folder {output_folder} already exists. Deleting...")
+        #sys.exit(1)
+        shutil.rmtree(output_folder)
 
     # Determine input format from extension
     input_format = None
@@ -1614,6 +1460,57 @@ def create_croissant_metadata(
     
     return None
 
+
+async def measure_baseline_bandwidth(timeout_seconds=30, test_size_mb=10):
+    """
+    Measure baseline download bandwidth using Cloudflare's speed test endpoint.
+    
+    Args:
+        timeout_seconds: Maximum time to wait for test
+        test_size_mb: Size of test file in MB (1-100)
+        
+    Returns:
+        Tuple of (bandwidth_mbps, bandwidth_MBps) or (None, None) on failure
+    """
+    test_size_bytes = test_size_mb * 1_000_000
+    test_url = f"https://speed.cloudflare.com/__down?bytes={test_size_bytes}"
+    
+    print(f"\n[Baseline] Measuring network bandwidth ({test_size_mb}MB test file)...")
+    
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds)
+        ) as session:
+            start_time = time.monotonic()
+            bytes_received = 0
+            
+            async with session.get(test_url) as response:
+                if response.status != 200:
+                    print(f"[Baseline] Warning: Test failed with status {response.status}")
+                    return None, None
+                
+                async for chunk in response.content.iter_chunked(65536):
+                    bytes_received += len(chunk)
+            
+            end_time = time.monotonic()
+            duration = end_time - start_time
+            
+            bandwidth_mbps = (bytes_received * 8) / (duration * 1_000_000)
+            bandwidth_MBps = bytes_received / (duration * 1_000_000)
+            
+            print(f"[Baseline] Network bandwidth: {bandwidth_mbps:.1f} Mbps ({bandwidth_MBps:.2f} MB/s)")
+            print(f"[Baseline] Test duration: {duration:.2f}s, Downloaded: {bytes_received / 1_000_000:.1f}MB")
+            
+            return bandwidth_mbps, bandwidth_MBps
+            
+    except asyncio.TimeoutError:
+        print(f"[Baseline] Warning: Bandwidth test timed out after {timeout_seconds}s")
+        return None, None
+    except Exception as e:
+        print(f"[Baseline] Warning: Bandwidth test failed: {e}")
+        return None, None
+
+
 async def main():
     global shutdown_flag
 
@@ -1624,6 +1521,12 @@ async def main():
         print(f"Using JSON configuration from: {args.config}")
     else:
         print("Using command-line arguments")
+
+    # Measure baseline bandwidth before starting downloads
+    baseline_bandwidth_mbps, baseline_bandwidth_MBps = await measure_baseline_bandwidth(
+        timeout_seconds=300,
+        test_size_mb=300
+    )
 
     input = args.input
     input_format = args.input_format
@@ -1637,7 +1540,6 @@ async def main():
     rate_capacity = args.rate_capacity
     enable_rate_limiting = args.enable_rate_limiting
     max_retry_attempts = args.max_retry_attempts
-    rate_control_mode = args.rate_control_mode
     create_overview = args.create_overview
     croissant_mode = args.croissant
     file_name_pattern = args.file_name_pattern
@@ -1665,21 +1567,16 @@ async def main():
     if enable_rate_limiting:
         token_bucket = TokenBucket(rate=rate_limit, capacity=rate_capacity)
         rate_controller = RateController(window_size=100)
-        
-        if rate_control_mode == "bbr":
-            # Initialize BBR-specific components
-            bbr_controller = BBRController(
-                bw_window=10,           # 10 intervals (~50s) for BtlBw max filter
-                rtprop_window=60,       # 60s for RTprop refresh
-                avg_file_size=None,     # Learn from first 5 downloads
-                file_size_warmup=5,
-                initial_rate=rate_limit
-            )
-            download_metrics = DownloadMetrics(window_seconds=60)
-            concurrency_limiter = ConcurrencyLimiter(initial_limit=concurrent_downloads, max_limit=concurrent_downloads*2)
-            print(f"Processing {filtered_count} images with BBR rate control (initial: {rate_limit:.1f} req/s, max concurrency: {concurrent_downloads})")
-        else:
-            print(f"Processing {filtered_count} images with AIMD rate control ({concurrent_downloads} concurrent, {rate_limit:.1f} req/s)")
+        bbr_controller = BBRController(
+            bw_window=10,           # 10 intervals (~50s) for BtlBw max filter
+            rtprop_window=60,       # 60s for RTprop refresh
+            avg_file_size=None,     # Learn from first 5 downloads
+            file_size_warmup=5,
+            initial_rate=rate_limit
+        )
+        download_metrics = DownloadMetrics(window_seconds=60)
+        concurrency_limiter = ConcurrencyLimiter(initial_limit=concurrent_downloads, max_limit=concurrent_downloads*2)
+        print(f"Processing {filtered_count} images with BBR rate control (initial: {rate_limit:.1f} req/s, max concurrency: {concurrent_downloads})")
     else:
         print(f"Processing {filtered_count} images with {concurrent_downloads} concurrent downloads (no rate limiting)")
 
@@ -1696,20 +1593,13 @@ async def main():
     recovery_task = None
     if enable_rate_limiting and token_bucket and rate_controller:
         max_rate = concurrent_downloads * 1.1
-        
-        if rate_control_mode == "bbr" and bbr_controller and download_metrics and concurrency_limiter:
-            print(f"Starting BBR rate controller (max: {max_rate:.1f} req/sec, interval: 5s)")
-            recovery_task = asyncio.create_task(
-                bbr_rate_controller(
-                    token_bucket, rate_controller, concurrency_limiter,
-                    bbr_controller, download_metrics, max_rate, interval=5
-                )
+        print(f"Starting BBR rate controller (max: {max_rate:.1f} req/sec, interval: 5s)")
+        recovery_task = asyncio.create_task(
+            bbr_rate_controller(
+                token_bucket, rate_controller, concurrency_limiter,
+                bbr_controller, download_metrics, max_rate, interval=5
             )
-        else:
-            print(f"Starting AIMD rate controller (max: {max_rate:.1f} req/sec, interval: 5s)")
-            recovery_task = asyncio.create_task(
-                aimd_convergence_controller(token_bucket, rate_controller, max_rate, interval=5)
-            )
+        )
 
     async with aiohttp.ClientSession(
         connector=connector,
@@ -1718,11 +1608,15 @@ async def main():
     ) as session:
         all_error_details = []
         total_successful_downloads = 0
+        total_unique_files_written = 0
+        total_collisions = 0
+        successfully_retried_keys = set()  # Track keys that succeeded on retry
+        pending_retry_keys = set()  # Track keys pending retry
         current_df = df.copy()
         attempt = 1
 
         while attempt <= max_retry_attempts and not current_df.empty and not shutdown_flag:
-            successful_downloads, error_details, retry_rows = await download_batch(
+            successful_downloads, error_details, retry_rows, successful_keys, unique_files_written, collision_count = await download_batch(
                 session, concurrent_downloads,
                 current_df,
                 output, output_format,
@@ -1738,17 +1632,43 @@ async def main():
             )
 
             total_successful_downloads += successful_downloads
+            total_unique_files_written += unique_files_written
+            total_collisions += collision_count
             all_error_details.extend(error_details)
+            
+            # Track which keys succeeded on retry (attempt > 1)
+            if attempt > 1:
+                retried_this_attempt = successful_keys & pending_retry_keys
+                successfully_retried_keys.update(retried_this_attempt)
 
             count_retry_errors = len(retry_rows)
             non_retry_errors = len(error_details) - count_retry_errors
 
-            print(f"\nAttempt #{attempt} Results:")
-            print(f"  - Successful downloads: {successful_downloads}")
-            print(f"  - Retry errors: {count_retry_errors}")
-            print(f"  - Other errors: {non_retry_errors}")
+            # Per-attempt status summary
+            print(f"\n{'='*60}")
+            print(f"Attempt #{attempt} Status Summary")
+            print(f"{'='*60}")
+            print(f"  URLs processed:        {len(current_df)}")
+            print(f"  Successful:            {successful_downloads}")
+            print(f"  Retry errors:          {count_retry_errors}")
+            print(f"  Permanent errors:      {non_retry_errors}")
+            print(f"  Filename collisions:   {collision_count}")
+            print(f"  Unique files written:  {unique_files_written}")
+            if attempt > 1:
+                print(f"  Retried successfully:  {len(retried_this_attempt)}")
+            print(f"{'='*60}")
 
             if retry_rows and attempt < max_retry_attempts and not shutdown_flag:
+                # Track keys from errors that will be retried
+                pending_retry_keys = {e['key'] for e in error_details if any([
+                    e['status_code'] == 429,
+                    "429" in str(e['error']),
+                    e['status_code'] == 504,
+                    "504" in str(e['error']),
+                    (e['status_code'] is not None and e['status_code'] >= 500),
+                    any(p in str(e['error']).lower() for p in ["connection reset by peer", "server disconnected", "connection refused"])
+                ])}
+                
                 current_df = pd.DataFrame(retry_rows)
                 attempt += 1
                 print(f"\nWaiting 2.0 seconds before retry attempt...")
@@ -1765,35 +1685,93 @@ async def main():
     if recovery_task:
         recovery_task.cancel()
 
+    # Measure bandwidth again after downloads
+    end_bandwidth_mbps, end_bandwidth_MBps = await measure_baseline_bandwidth(
+        timeout_seconds=300,
+        test_size_mb=300
+    )
+
     # Use the aggregated results
     successful_downloads = total_successful_downloads
-    error_details = all_error_details
+    
+    # Filter out errors that were successfully retried
+    final_error_details = [
+        e for e in all_error_details 
+        if e['key'] not in successfully_retried_keys
+    ]
+    
+    # Count actual files on disk
+    actual_file_count = 0
+    if os.path.exists(output):
+        for root, dirs, files in os.walk(output):
+            actual_file_count += len(files)
 
     download_end_time = time.monotonic()
     download_time = download_end_time - download_start_time
     total_downloaded = sum(total_bytes)  # Total bytes downloaded
-    total_errors = len(error_details)
+    permanent_errors = len(final_error_details)
 
-    # Print download summary
-    print(f"\nDownload Summary:")
-    print(f"  - Successful downloads: {successful_downloads}")
-    print(f"  - Failed downloads: {total_errors}")
-    if successful_downloads + total_errors > 0:
-        print(f"  - Success rate: {(successful_downloads/(successful_downloads+total_errors)*100):.1f}%")
+    # Print comprehensive final status summary
+    print(f"\n{'='*60}")
+    print(f"FINAL STATUS SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Total URLs in input:     {filtered_count}")
+    print(f"  Successful downloads:    {successful_downloads}")
+    print(f"  Retried successfully:    {len(successfully_retried_keys)}")
+    print(f"  Permanent failures:      {permanent_errors}")
+    print(f"  Total collisions:        {total_collisions}")
+    print(f"  Unique files written:    {total_unique_files_written}")
+    print(f"  Actual files on disk:    {actual_file_count}")
+    if successful_downloads > 0:
+        success_rate = (successful_downloads / filtered_count) * 100
+        print(f"  Success rate:            {success_rate:.1f}%")
+    
+    # Check for file count mismatch
+    if actual_file_count != successful_downloads:
+        print(f"\n  WARNING: File count mismatch!")
+        print(f"    Expected (successful): {successful_downloads}")
+        print(f"    Actual on disk:        {actual_file_count}")
+        print(f"    Difference:            {successful_downloads - actual_file_count}")
+    print(f"{'='*60}")
     
     if download_time > 0 and total_downloaded > 0:
         avg_speed = total_downloaded / download_time  # Bytes per second
+        avg_speed_MBps = avg_speed / 1e6
+        avg_speed_mbps = (avg_speed * 8) / 1e6
+        print(f"\nDownload Performance:")
         print(f"  - Total Data: {total_downloaded / 1e6:.2f} MB")
         print(f"  - Download Time: {download_time:.2f} sec")
-        print(f"  - Avg Download Speed: {avg_speed / 1e6:.2f} MB/s")
+        print(f"  - Avg Download Speed: {avg_speed_MBps:.2f} MB/s ({avg_speed_mbps:.1f} Mbps)")
+        
+        # Compare with baseline bandwidth
+        if baseline_bandwidth_mbps is not None or end_bandwidth_mbps is not None:
+            print(f"\nBandwidth Comparison:")
+            if baseline_bandwidth_mbps is not None:
+                print(f"  - Start bandwidth: {baseline_bandwidth_mbps:.1f} Mbps ({baseline_bandwidth_MBps:.2f} MB/s)")
+            else:
+                print(f"  - Start bandwidth: N/A")
+            if end_bandwidth_mbps is not None:
+                print(f"  - End bandwidth: {end_bandwidth_mbps:.1f} Mbps ({end_bandwidth_MBps:.2f} MB/s)")
+            else:
+                print(f"  - End bandwidth: N/A")
+            
+            # Calculate average baseline
+            valid_measurements = [m for m in [baseline_bandwidth_mbps, end_bandwidth_mbps] if m is not None]
+            if valid_measurements:
+                avg_baseline_mbps = sum(valid_measurements) / len(valid_measurements)
+                avg_baseline_MBps = avg_baseline_mbps / 8
+                efficiency = (avg_speed_mbps / avg_baseline_mbps) * 100
+                print(f"  - Average baseline: {avg_baseline_mbps:.1f} Mbps ({avg_baseline_MBps:.2f} MB/s)")
+                print(f"  - Actual download bandwidth: {avg_speed_mbps:.1f} Mbps ({avg_speed_MBps:.2f} MB/s)")
+                print(f"  - Efficiency: {efficiency:.1f}% of baseline")
     else:
         print("  - No successful downloads to compute bandwidth statistics.")
     
-    # Display detailed error breakdown
-    if total_errors > 0:
-        print(f"\nError Breakdown:")
+    # Display detailed error breakdown (only permanent errors, not retried)
+    if permanent_errors > 0:
+        print(f"\nPermanent Error Breakdown:")
         error_counts = {}
-        for error_info in error_details:
+        for error_info in final_error_details:
             error_type = error_info['error']
             if error_type in error_counts:
                 error_counts[error_type] += 1
@@ -1848,7 +1826,7 @@ async def main():
             input, input_format, output, output_format,
             url_col, class_col,
             concurrent_downloads, timeout,
-            error_details, successful_downloads, total_bytes, download_time, total_errors, total_downloaded, filtered_count,
+            final_error_details, successful_downloads, total_bytes, download_time, permanent_errors, total_downloaded, filtered_count,
             rate_limit, rate_capacity, token_bucket, enable_rate_limiting, max_retry_attempts
         )
     else:
